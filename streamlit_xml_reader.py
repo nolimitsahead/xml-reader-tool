@@ -9,12 +9,12 @@ import streamlit as st
 st.set_page_config(page_title="XML Reader • Streamlit", page_icon="📦", layout="wide")
 st.title("📦 XML Reader & Explorer")
 st.caption(
-    "Tải XML lên, xem cấu trúc, tìm kiếm theo tag/attribute/text, lọc bằng XPath, và xuất CSV/JSON."
+    "Upload XML, inspect structure, search by tag/attribute/text, run XPath, and export CSV/JSON."
 )
 
 
 # ------------------------------
-# Helpers (dùng cho XML thường)
+# Helpers for standard (non-SpreadsheetML) XML
 # ------------------------------
 def _to_safe_text(s: Optional[str]) -> str:
     if s is None:
@@ -30,7 +30,12 @@ def _serialize_attrib(attrib: Dict[str, str]) -> str:
 
 
 def iter_flatten(root: ET.Element) -> List[Dict[str, str]]:
-    """Flatten XML thường thành bảng row-per-element."""
+    """
+    Flatten a standard XML tree into a row-per-element table.
+
+    Columns: index, depth, tag, path, attrib(json), text, tail, n_children
+    Path format: /tag[i]/child[j] ... where i/j are 1-based sibling indices of the same tag.
+    """
     rows: List[Dict[str, str]] = []
 
     def dfs(
@@ -69,6 +74,7 @@ def search_rows(
     if tag:
         filt &= df["tag"].str.contains(tag, case=False, na=False)
     if attr_key:
+        # attribute JSON contains key
         filt &= df["attrib"].str.contains(rf'"{attr_key}"\s*:', regex=True, na=False)
     if attr_val:
         filt &= df["attrib"].str.contains(attr_val, case=False, na=False)
@@ -78,13 +84,13 @@ def search_rows(
 
 
 # ------------------------------
-# Helpers (mới) cho Excel XML (SpreadsheetML)
+# Helpers for Excel 2003 XML (SpreadsheetML)
 # ------------------------------
 SS_NS = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
 
 
 def is_spreadsheetml_xml(content: bytes) -> bool:
-    # Nhan dien nhanh: có namespace Excel SpreadsheetML
+    """Detect SpreadsheetML by its namespace / mso hint."""
     return (
         b"urn:schemas-microsoft-com:office:spreadsheet" in content
         or b"mso-application" in content
@@ -92,7 +98,7 @@ def is_spreadsheetml_xml(content: bytes) -> bool:
 
 
 def _rows_from_spreadsheetml_table(table: ET.Element) -> List[List[object]]:
-    """Đọc ss:Table → list các hàng (đã chèn None theo ss:Index)."""
+    """Read ss:Table into a list of rows, honoring ss:Index (sparse cells) and ss:Type."""
     rows: List[List[object]] = []
     for row in table.findall("ss:Row", SS_NS):
         vals: List[object] = []
@@ -126,7 +132,7 @@ def _rows_from_spreadsheetml_table(table: ET.Element) -> List[List[object]]:
                     vals.append(txt)
             col_i += 1
         rows.append(vals)
-    # chuẩn hóa độ dài
+    # Normalize width
     width = max((len(r) for r in rows), default=0)
     rows = [r + [None] * (width - len(r)) for r in rows]
     return rows
@@ -135,7 +141,7 @@ def _rows_from_spreadsheetml_table(table: ET.Element) -> List[List[object]]:
 def _pick_header_index(
     rows: List[List[object]], min_non_null: int = 3
 ) -> Optional[int]:
-    """Chọn dòng header: dòng đầu tiên có >= min_non_null ô không rỗng."""
+    """Pick the header row as the first row with >= min_non_null non-empty cells."""
     for i, r in enumerate(rows):
         nn = sum(x is not None and str(x).strip() != "" for x in r)
         if nn >= min_non_null:
@@ -149,7 +155,7 @@ def parse_spreadsheetml(
     header_row_manual: int = 1,
     min_non_null_header: int = 3,
 ) -> Dict[str, pd.DataFrame]:
-    """Trả về dict[WorksheetName] = DataFrame."""
+    """Return dict[WorksheetName] = DataFrame from SpreadsheetML content."""
     root = ET.fromstring(content)
     dfs: Dict[str, pd.DataFrame] = {}
     for ws in root.findall(".//ss:Worksheet", SS_NS):
@@ -188,41 +194,45 @@ def parse_spreadsheetml(
 # Sidebar
 # ------------------------------
 with st.sidebar:
-    st.header("⚙️ Tuỳ chọn")
-    show_raw = st.toggle("Hiện nội dung XML raw", value=False)
+    st.header("⚙️ Options")
+    show_raw = st.toggle("Show raw XML content", value=False)
     use_iterparse = st.toggle(
-        "Dùng iterparse (file lớn)",
+        "Use iterparse (large files)",
         value=False,
-        help="Bật khi file rất lớn để giảm RAM (XML thường).",
+        help="Enable for very large files to save RAM (you'll lose some preview features).",
     )
-    # Tuỳ chọn riêng cho SpreadsheetML
+    # SpreadsheetML-only options
     st.markdown("**Excel XML (SpreadsheetML)**")
     spreadsheetml_header_mode = st.radio(
-        "Header mode", ["auto", "manual"], index=0, help="Dành cho Excel XML"
+        "Header mode", ["auto", "manual"], index=0, help="For Excel XML only"
     )
     spreadsheetml_header_row = st.number_input(
         "Header row (1-based, manual)", min_value=1, value=1, step=1
     )
     spreadsheetml_min_nonnull = st.number_input(
-        "Min non-null cells to detect header (auto)", min_value=1, value=3, step=1
+        "Min non-empty cells to detect header (auto)", min_value=1, value=3, step=1
     )
     max_preview_chars = st.number_input(
-        "Giới hạn ký tự preview", min_value=200, max_value=20000, value=2000, step=200
+        "Raw preview character limit",
+        min_value=200,
+        max_value=20000,
+        value=2000,
+        step=200,
     )
 
 # ------------------------------
 # File upload
 # ------------------------------
-uploaded = st.file_uploader("📂 Chọn file XML", type=["xml"])
+uploaded = st.file_uploader("📂 Choose an XML file", type=["xml"])
 if uploaded is None:
-    st.info("⬆️ Tải một file .xml để bắt đầu.")
+    st.info("⬆️ Upload a .xml file to get started.")
     st.stop()
 
 content_bytes = uploaded.read()
 
 # Raw preview
 if show_raw:
-    st.subheader("🔎 XML Raw (preview)")
+    st.subheader("🔎 Raw XML (preview)")
     raw_text = content_bytes.decode("utf-8", errors="replace")
     st.code(
         raw_text[:max_preview_chars]
@@ -231,14 +241,13 @@ if show_raw:
     )
 
 # ------------------------------
-# Branch: SpreadsheetML hay XML thường?
+# Branch: SpreadsheetML vs standard XML
 # ------------------------------
 if is_spreadsheetml_xml(content_bytes):
     st.success(
-        "🧾 Phát hiện Excel 2003 XML (SpreadsheetML). Đang parse theo Worksheet/Table/Row/Cell…"
+        "🧾 Detected Excel 2003 XML (SpreadsheetML). Parsing via Worksheet/Table/Row/Cell…"
     )
 
-    # Parse SpreadsheetML → dict of DataFrames
     dfs = parse_spreadsheetml(
         content_bytes,
         header_mode=spreadsheetml_header_mode,
@@ -246,29 +255,30 @@ if is_spreadsheetml_xml(content_bytes):
         min_non_null_header=int(spreadsheetml_min_nonnull),
     )
 
-    # Tổng quan sheet
-    info_rows = []
-    for name, df in dfs.items():
-        info_rows.append({"Worksheet": name, "Rows": df.shape[0], "Cols": df.shape[1]})
-    st.subheader("📑 Tổng quan Worksheet")
+    # Worksheet overview
+    info_rows = [
+        {"Worksheet": name, "Rows": df.shape[0], "Cols": df.shape[1]}
+        for name, df in dfs.items()
+    ]
+    st.subheader("📑 Worksheet overview")
     st.dataframe(pd.DataFrame(info_rows), use_container_width=True)
 
-    # Chọn sheet để xem
+    # Select sheet to preview
     sheet_names = list(dfs.keys())
     if not sheet_names:
-        st.warning("Không tìm thấy Table nào trong file.")
+        st.warning("No tables found in this file.")
         st.stop()
 
-    sel = st.selectbox("Chọn Worksheet để xem", options=sheet_names, index=0)
+    sel = st.selectbox("Select a worksheet to view", options=sheet_names, index=0)
     df_show = dfs[sel]
     st.dataframe(df_show.head(2000), use_container_width=True)
 
-    # Download nút: per-sheet & combined
-    st.subheader("📥 Xuất CSV")
+    # Downloads
+    st.subheader("📥 Export CSV")
     colA, colB = st.columns(2)
     with colA:
         st.download_button(
-            f"Tải CSV – {sel}",
+            f"Download CSV – {sel}",
             data=df_show.to_csv(index=False).encode("utf-8"),
             file_name=f"{sel}.csv",
             mime="text/csv",
@@ -278,19 +288,19 @@ if is_spreadsheetml_xml(content_bytes):
             [d.assign(Worksheet=n) for n, d in dfs.items()], ignore_index=True
         )
         st.download_button(
-            "Tải CSV – combined (tất cả sheet)",
+            "Download CSV – combined (all sheets)",
             data=combined.to_csv(index=False).encode("utf-8"),
             file_name="spreadsheetml_combined.csv",
             mime="text/csv",
         )
 
     st.caption(
-        "💡 Mẹo: Nếu header auto chưa đúng, chuyển sang 'manual' và đặt 'Header row' cho chuẩn."
+        "💡 Tip: If automatic header detection looks off, switch to 'manual' and set the header row explicitly."
     )
 
 else:
-    # XML thường: chạy pipeline cũ (flatten + search + XPath)
-    st.info("🧩 XML thường (không phải SpreadsheetML). Sử dụng chế độ Flatten + XPath.")
+    # Standard XML: run the original flatten + search + XPath flow
+    st.info("🧩 Standard XML (not SpreadsheetML). Using Flatten + XPath mode.")
     parse_error = None
     root: Optional[ET.Element] = None
 
@@ -305,20 +315,20 @@ else:
                 if event == "start" and root is None:
                     root = elem
             if root is None:
-                raise ET.ParseError("Không tìm thấy root element")
+                raise ET.ParseError("Root element not found")
         else:
             root = parse_with_elementtree(content_bytes)
     except ET.ParseError as e:
         parse_error = f"XML ParseError: {e}"
     except Exception as e:
-        parse_error = f"Lỗi khi đọc XML: {e}"
+        parse_error = f"Error reading XML: {e}"
 
     if parse_error:
         st.error(parse_error)
         st.stop()
     assert root is not None
 
-    with st.spinner("Đang chuyển XML thành bảng…"):
+    with st.spinner("Converting XML to a table…"):
         rows = iter_flatten(root)
         df = (
             pd.DataFrame(
@@ -338,38 +348,38 @@ else:
             .reset_index(drop=True)
         )
 
-    st.success(f"✅ Đã parse xong: {len(df):,} elements")
+    st.success(f"✅ Parsed: {len(df):,} elements")
 
-    st.subheader("🔍 Tìm kiếm / Lọc")
+    st.subheader("🔍 Search / Filter")
     col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 2, 1])
     with col1:
-        q_tag = st.text_input("Tag contains", placeholder="e.g. item | patient | book")
+        q_tag = st.text_input("Tag contains", placeholder="e.g., item | patient | book")
     with col2:
-        q_attr_key = st.text_input("Attribute key", placeholder="e.g. id | name")
+        q_attr_key = st.text_input("Attribute key", placeholder="e.g., id | name")
     with col3:
         q_attr_val = st.text_input(
-            "Attribute value contains", placeholder="e.g. 123 | John"
+            "Attribute value contains", placeholder="e.g., 123 | John"
         )
     with col4:
         q_text = st.text_input(
-            "Text contains", placeholder="e.g. Hà Nội | Warsaw | Stockholm"
+            "Text contains", placeholder="e.g., Hanoi | Warsaw | Stockholm"
         )
     with col5:
         max_rows = st.number_input(
-            "Hiển thị tối đa", min_value=50, max_value=100000, value=2000, step=50
+            "Show up to", min_value=50, max_value=100000, value=2000, step=50
         )
 
     filtered = search_rows(
         df, q_tag.strip(), q_attr_key.strip(), q_attr_val.strip(), q_text.strip()
     )
-    st.caption(f"Kết quả: {len(filtered):,} hàng")
+    st.caption(f"Results: {len(filtered):,} rows")
     st.dataframe(filtered.head(int(max_rows)), use_container_width=True)
 
     st.divider()
-    st.subheader("🧭 XPath (ElementTree) — tùy chọn")
+    st.subheader("🧭 XPath (ElementTree) — optional")
     xpath = st.text_input(
-        "Nhập XPath (ví dụ: .//book[@id='x'] | .//patient/name)",
-        help="Hỗ trợ subset của XPath theo xml.etree.ElementTree",
+        "Enter XPath (e.g., .//book[@id='x'] | .//patient/name)",
+        help="Supports the subset of XPath implemented by xml.etree.ElementTree.",
     )
     if xpath:
         try:
@@ -383,7 +393,7 @@ else:
                 }
                 for m in matches
             ]
-            st.info(f"XPath trả về {len(rows_x):,} node")
+            st.info(f"XPath returned {len(rows_x):,} nodes")
             st.dataframe(pd.DataFrame(rows_x).head(2000), use_container_width=True)
         except SyntaxError as e:
             st.error(f"XPath SyntaxError: {e}")
@@ -391,24 +401,24 @@ else:
             st.error(f"XPath error: {e}")
 
     st.divider()
-    st.subheader("📥 Xuất dữ liệu")
+    st.subheader("📥 Downloads")
     st.download_button(
-        "Tải JSON (toàn bộ)",
+        "Download JSON (full table)",
         data=df.to_json(orient="records", force_ascii=False).encode("utf-8"),
         file_name="xml_flatten.json",
         mime="application/json",
     )
     st.download_button(
-        "Tải CSV (bảng đã lọc)",
+        "Download CSV (filtered table)",
         data=filtered.to_csv(index=False).encode("utf-8"),
         file_name="xml_filtered.csv",
         mime="text/csv",
     )
 
     st.divider()
-    st.subheader("🌳 Tree preview (đường dẫn)")
+    st.subheader("🌳 Tree preview (paths)")
     preview_depth = st.slider(
-        "Độ sâu tối đa",
+        "Max depth",
         min_value=0,
         max_value=int(df["depth"].max()),
         value=min(3, int(df["depth"].max())),
@@ -418,5 +428,5 @@ else:
     ].head(3000)
     st.dataframe(preview_df, use_container_width=True)
     st.caption(
-        "💡 Mẹo: dùng cột `path` để định vị node khi xử lý downstream (ví dụ: /root[1]/patient[12]/name[1])."
+        "💡 Tip: use the `path` column to locate nodes downstream (e.g., /root[1]/patient[12]/name[1])."
     )
